@@ -52,7 +52,7 @@ class WorldFacade {
 			throw new Error('Config options should be an object. Config reference: https://fantasticdice.games/docs/usage/config#configuration-options')
 		}
 		// pull out callback functions from options
-		const { onCollision, onBeforeRoll, onDieComplete, onRollComplete, onRemoveComplete, onThemeConfigLoaded, onThemeLoaded, ...boxOptions } = options
+		const { onCollision, onDieImpact, onBeforeRoll, onDieComplete, onRollComplete, onRemoveComplete, onThemeConfigLoaded, onThemeLoaded, ...boxOptions } = options
 
 		// extend defaults with options
 		this.config = {...defaultOptions, ...boxOptions}
@@ -64,7 +64,8 @@ class WorldFacade {
 		this.onRemoveComplete = options.onRemoveComplete || this.noop
 		this.onThemeLoaded = options.onThemeLoaded || this.noop
 		this.onThemeConfigLoaded = options.onThemeConfigLoaded || this.noop
-		this.onCollision = options.onCollision || this.noop; // Add the new collision callback
+		this.onCollision = options.onCollision || this.noop
+		this.onDieImpact = options.onDieImpact || this.noop
 
 
 		// is webGL supported?
@@ -142,10 +143,9 @@ class WorldFacade {
 				case "init-complete":
 					this.#dicePhysicsResolve(); // fulfill promise so other things can run
 					break;
-				case "collision": // Handle collision events from the worker
-                    if (this.onCollision) {
-                        this.onCollision(e.data.body0Id, e.data.body1Id, e.data.force);
-                    }
+				case "collision":
+					this.onCollision(e.data.body0Id, e.data.body1Id, e.data.intensity, e.data)
+					this.onDieImpact(this.#normalizeImpactEvent(e.data))
                     break;
 			}
     }
@@ -156,6 +156,32 @@ class WorldFacade {
 			height: this.canvas.clientHeight,
 			options: this.config
 		})
+	}
+
+	#normalizeImpactEvent(event) {
+		const dieEntries = Object.values(this.rollDiceData)
+		const body0Die = dieEntries.find((die) => die.id === event.body0Id)
+		const body1Die = dieEntries.find((die) => die.id === event.body1Id)
+		const die = body0Die || body1Die
+		const otherId = body0Die ? event.body1Id : event.body0Id
+
+		return {
+			dieId: die?.id ?? event.body0Id,
+			rollId: die?.rollId,
+			value: die?.value,
+			kind: event.kind || this.#getImpactKind(otherId, body0Die && body1Die),
+			intensity: event.intensity,
+			impulse: event.impulse,
+			velocity: event.velocity,
+			at: event.at || Date.now()
+		}
+	}
+
+	#getImpactKind(bodyId, isDieCollision) {
+		if(isDieCollision) return 'die'
+		if(bodyId === 'box_bottom') return 'surface'
+		if(typeof bodyId === 'string' && bodyId.startsWith('box_wall')) return 'wall'
+		return 'unknown'
 	}
 
 	#connectWorld(){

@@ -29,6 +29,8 @@ const defaultOptions = {
 	linearDamping: .5,
 	angularDamping: .4,
 	settleTimeout: 5000,
+	impactThreshold: .12,
+	impactCooldown: 70,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -36,6 +38,7 @@ let config = {...defaultOptions}
 
 let emptyVector
 let diceBufferView
+let lastImpactByPair = {}
 
 self.onmessage = (e) => {
   switch (e.data.action) {
@@ -505,6 +508,7 @@ const clearDice = () => {
 		diceBufferView.fill(0)
 	}
 	stopLoop = true
+	lastImpactByPair = {}
 	// clear all bodies
 	bodies.forEach(body => physicsWorld.removeRigidBody(body))
 	sleepingBodies.forEach(body => physicsWorld.removeRigidBody(body))
@@ -530,6 +534,84 @@ const setupPhysicsWorld = () => {
 	return World
 }
 
+const isBoxBody = (bodyId) => typeof bodyId === 'string' && bodyId.startsWith('box_')
+
+const isActiveDieBody = (bodyId) => bodies.some((body) => body.id === bodyId)
+
+const getImpactKind = (body0Id, body1Id) => {
+	if(body0Id === 'box_bottom' || body1Id === 'box_bottom') return 'surface'
+	if(isBoxBody(body0Id) || isBoxBody(body1Id)) return 'wall'
+	if(isActiveDieBody(body0Id) && isActiveDieBody(body1Id)) return 'die'
+	return 'unknown'
+}
+
+const getImpactPairKey = (body0Id, body1Id) => [body0Id, body1Id].sort().join(':')
+
+const reportImpacts = () => {
+	const now = Date.now()
+	const numManifolds = physicsWorld.getDispatcher().getNumManifolds()
+
+	for (let i = 0; i < numManifolds; i++) {
+		const contactManifold = physicsWorld.getDispatcher().getManifoldByIndexInternal(i)
+		const body0 = Ammo.castObject(contactManifold.getBody0(), Ammo.btRigidBody)
+		const body1 = Ammo.castObject(contactManifold.getBody1(), Ammo.btRigidBody)
+		const body0Id = body0.id
+		const body1Id = body1.id
+
+		if(!isActiveDieBody(body0Id) && !isActiveDieBody(body1Id)) {
+			continue
+		}
+
+		let maxImpulse = 0
+		let maxVelocity = 0
+		const numContacts = contactManifold.getNumContacts()
+
+		for (let j = 0; j < numContacts; j++) {
+			const contactPoint = contactManifold.getContactPoint(j)
+
+			if (contactPoint.getDistance() > .02) {
+				continue
+			}
+
+			maxImpulse = Math.max(maxImpulse, Math.abs(contactPoint.getAppliedImpulse()))
+
+			const velocity0 = body0.getLinearVelocity()
+			const velocity1 = body1.getLinearVelocity()
+			const relativeX = velocity0.x() - velocity1.x()
+			const relativeY = velocity0.y() - velocity1.y()
+			const relativeZ = velocity0.z() - velocity1.z()
+			const relativeVelocity = Math.sqrt(
+				relativeX * relativeX
+				+ relativeY * relativeY
+				+ relativeZ * relativeZ
+			)
+			maxVelocity = Math.max(maxVelocity, relativeVelocity)
+		}
+
+		const intensity = Math.min(1, Math.max(maxImpulse / 2.5, maxVelocity / 9))
+		if(intensity < config.impactThreshold) {
+			continue
+		}
+
+		const pairKey = getImpactPairKey(body0Id, body1Id)
+		if(lastImpactByPair[pairKey] && now - lastImpactByPair[pairKey] < config.impactCooldown) {
+			continue
+		}
+		lastImpactByPair[pairKey] = now
+
+		self.postMessage({
+			action: "collision",
+			body0Id,
+			body1Id,
+			kind: getImpactKind(body0Id, body1Id),
+			intensity,
+			impulse: maxImpulse,
+			velocity: maxVelocity,
+			at: now
+		})
+	}
+}
+
 const update = (delta) => {
 	// step world
 	const deltaTime = delta / 1000
@@ -540,55 +622,7 @@ const update = (delta) => {
 
 	diceBufferView[0] = bodies.length
 
-	// Detect collisions
-    const numManifolds = physicsWorld.getDispatcher().getNumManifolds();
-    for (let i = 0; i < numManifolds; i++) {
-        const contactManifold = physicsWorld.getDispatcher().getManifoldByIndexInternal(i);
-        const body0 = Ammo.castObject(contactManifold.getBody0(), Ammo.btRigidBody);
-        const body1 = Ammo.castObject(contactManifold.getBody1(), Ammo.btRigidBody);
-
-        const rb0Id = body0.id;
-        const rb1Id = body1.id;
-
-        let totalForce = 0;
-
-        // Calculate collision force
-        const numContacts = contactManifold.getNumContacts();
-        for (let j = 0; j < numContacts; j++) {
-            const contactPoint = contactManifold.getContactPoint(j);
-
-            // Check if the contact point indicates collision (penetration depth)
-            if (contactPoint.getDistance() < 0) {
-                // Relative velocity of the two bodies at the contact point
-                const normal = contactPoint.get_m_normalWorldOnB();
-
-                const velocity0 = body0.getLinearVelocity();
-                const velocity1 = body1.getLinearVelocity();
-
-                // Calculate relative velocity
-                const relativeVelocity = new Ammo.btVector3();
-                relativeVelocity.setValue(
-                    velocity0.x() - velocity1.x(),
-                    velocity0.y() - velocity1.y(),
-                    velocity0.z() - velocity1.z()
-                );
-
-                // Calculate the force (F = m * a) based on velocity and collision normal
-                const collisionForce = normal.dot(relativeVelocity);
-                totalForce += Math.abs(collisionForce);  // Add to total collision force
-							}
-						}
-						
-        if (totalForce > 0) {
-            // Send the collision data to the main thread
-            self.postMessage({
-                action: "collision",
-                body0Id: rb0Id,
-                body1Id: rb1Id,
-                force: totalForce
-            });
-        }
-    }
+	reportImpacts()
 
 	// looping backwards since bodies are removed as they are put to sleep
 	for (let i = bodies.length - 1; i >= 0; i--) {
