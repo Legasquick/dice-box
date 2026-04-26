@@ -31,6 +31,9 @@ const defaultOptions = {
 	settleTimeout: 5000,
 	impactThreshold: .12,
 	impactCooldown: 70,
+	impactReleaseMs: 120,
+	impactRetriggerDelta: .35,
+	impactNormalVelocityFloor: .18,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -38,7 +41,7 @@ let config = {...defaultOptions}
 
 let emptyVector
 let diceBufferView
-let lastImpactByPair = {}
+let contactStateByPair = {}
 
 self.onmessage = (e) => {
   switch (e.data.action) {
@@ -508,7 +511,7 @@ const clearDice = () => {
 		diceBufferView.fill(0)
 	}
 	stopLoop = true
-	lastImpactByPair = {}
+	contactStateByPair = {}
 	// clear all bodies
 	bodies.forEach(body => physicsWorld.removeRigidBody(body))
 	sleepingBodies.forEach(body => physicsWorld.removeRigidBody(body))
@@ -550,6 +553,7 @@ const getImpactPairKey = (body0Id, body1Id) => [body0Id, body1Id].sort().join(':
 const reportImpacts = () => {
 	const now = Date.now()
 	const numManifolds = physicsWorld.getDispatcher().getNumManifolds()
+	const activePairKeys = new Set()
 
 	for (let i = 0; i < numManifolds; i++) {
 		const contactManifold = physicsWorld.getDispatcher().getManifoldByIndexInternal(i)
@@ -563,7 +567,8 @@ const reportImpacts = () => {
 		}
 
 		let maxImpulse = 0
-		let maxVelocity = 0
+		let maxNormalVelocity = 0
+		let hasContact = false
 		const numContacts = contactManifold.getNumContacts()
 
 		for (let j = 0; j < numContacts; j++) {
@@ -573,31 +578,53 @@ const reportImpacts = () => {
 				continue
 			}
 
+			hasContact = true
 			maxImpulse = Math.max(maxImpulse, Math.abs(contactPoint.getAppliedImpulse()))
 
+			const normal = contactPoint.get_m_normalWorldOnB()
 			const velocity0 = body0.getLinearVelocity()
 			const velocity1 = body1.getLinearVelocity()
 			const relativeX = velocity0.x() - velocity1.x()
 			const relativeY = velocity0.y() - velocity1.y()
 			const relativeZ = velocity0.z() - velocity1.z()
-			const relativeVelocity = Math.sqrt(
-				relativeX * relativeX
-				+ relativeY * relativeY
-				+ relativeZ * relativeZ
+			const normalVelocity = Math.abs(
+				normal.x() * relativeX
+				+ normal.y() * relativeY
+				+ normal.z() * relativeZ
 			)
-			maxVelocity = Math.max(maxVelocity, relativeVelocity)
+			maxNormalVelocity = Math.max(maxNormalVelocity, normalVelocity)
 		}
 
-		const intensity = Math.min(1, Math.max(maxImpulse / 2.5, maxVelocity / 9))
-		if(intensity < config.impactThreshold) {
+		if(!hasContact) {
 			continue
 		}
 
 		const pairKey = getImpactPairKey(body0Id, body1Id)
-		if(lastImpactByPair[pairKey] && now - lastImpactByPair[pairKey] < config.impactCooldown) {
+		activePairKeys.add(pairKey)
+
+		const intensity = Math.min(1, Math.max(maxImpulse / 2.5, maxNormalVelocity / 6.5))
+		const previousContact = contactStateByPair[pairKey]
+		const isNewContact = !previousContact || now - previousContact.lastSeenAt > config.impactReleaseMs
+		const isHardNewHit = previousContact
+			&& intensity >= previousContact.peakIntensity + config.impactRetriggerDelta
+			&& now - previousContact.lastImpactAt > config.impactCooldown
+		const hasEnoughNormalHit = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= .35
+
+		contactStateByPair[pairKey] = {
+			lastSeenAt: now,
+			lastImpactAt: previousContact?.lastImpactAt || 0,
+			peakIntensity: isNewContact ? intensity : Math.max(previousContact?.peakIntensity || 0, intensity)
+		}
+
+		if(
+			intensity < config.impactThreshold
+			|| !hasEnoughNormalHit
+			|| (!isNewContact && !isHardNewHit)
+		) {
 			continue
 		}
-		lastImpactByPair[pairKey] = now
+
+		contactStateByPair[pairKey].lastImpactAt = now
 
 		self.postMessage({
 			action: "collision",
@@ -606,10 +633,16 @@ const reportImpacts = () => {
 			kind: getImpactKind(body0Id, body1Id),
 			intensity,
 			impulse: maxImpulse,
-			velocity: maxVelocity,
+			velocity: maxNormalVelocity,
 			at: now
 		})
 	}
+
+	Object.entries(contactStateByPair).forEach(([pairKey, contact]) => {
+		if(!activePairKeys.has(pairKey) && now - contact.lastSeenAt > config.impactReleaseMs) {
+			delete contactStateByPair[pairKey]
+		}
+	})
 }
 
 const update = (delta) => {
