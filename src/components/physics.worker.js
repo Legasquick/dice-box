@@ -29,11 +29,12 @@ const defaultOptions = {
 	linearDamping: .5,
 	angularDamping: .4,
 	settleTimeout: 5000,
-	impactThreshold: .12,
-	impactCooldown: 70,
-	impactReleaseMs: 120,
-	impactRetriggerDelta: .35,
-	impactNormalVelocityFloor: .18,
+	impactThreshold: .22,
+	impactCooldown: 110,
+	impactReleaseMs: 240,
+	impactRetriggerDelta: .5,
+	impactNormalVelocityFloor: .42,
+	impactImpulseFloor: .55,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -602,13 +603,13 @@ const reportImpacts = () => {
 		const pairKey = getImpactPairKey(body0Id, body1Id)
 		activePairKeys.add(pairKey)
 
-		const intensity = Math.min(1, Math.max(maxImpulse / 2.5, maxNormalVelocity / 6.5))
+		const intensity = Math.min(1, Math.max(maxImpulse / 3.5, maxNormalVelocity / 8.5))
 		const previousContact = contactStateByPair[pairKey]
 		const isNewContact = !previousContact || now - previousContact.lastSeenAt > config.impactReleaseMs
 		const isHardNewHit = previousContact
 			&& intensity >= previousContact.peakIntensity + config.impactRetriggerDelta
 			&& now - previousContact.lastImpactAt > config.impactCooldown
-		const hasEnoughNormalHit = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= .35
+		const hasEnoughNormalHit = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= config.impactImpulseFloor
 
 		contactStateByPair[pairKey] = {
 			lastSeenAt: now,
