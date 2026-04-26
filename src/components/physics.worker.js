@@ -37,6 +37,9 @@ const defaultOptions = {
 	impactImpulseFloor: .55,
 	impactReleaseThreshold: .1,
 	impactReleaseNormalVelocityFloor: .18,
+	impactSurfaceThreshold: .16,
+	impactSurfaceRetriggerVelocityFloor: .32,
+	impactSurfaceRetriggerCooldown: 80,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -617,6 +620,7 @@ const evaluateImpactCandidate = ({
 	intensity,
 	maxImpulse,
 	maxNormalVelocity,
+	downwardSpeed,
 	activeBucketKeys
 }) => {
 	const bucketKey = getContactBucketKey(rigidBody, bodyId, kind, worldNormal)
@@ -632,6 +636,11 @@ const evaluateImpactCandidate = ({
 		&& !releaseSatisfied
 		&& intensity >= previous.peakIntensity + config.impactRetriggerDelta
 		&& now - previous.lastImpactAt > config.impactCooldown
+	const isSurfaceRehit = kind === 'surface'
+		&& previous
+		&& downwardSpeed >= config.impactSurfaceRetriggerVelocityFloor
+		&& intensity >= config.impactSurfaceThreshold
+		&& now - previous.lastImpactAt > config.impactSurfaceRetriggerCooldown
 	const hasEnoughImpact = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= config.impactImpulseFloor
 
 	contactStateByBucket[bucketKey] = {
@@ -649,7 +658,7 @@ const evaluateImpactCandidate = ({
 		return null
 	}
 
-	if(!contactStateByBucket[bucketKey].armed && !isHardRetrigger) {
+	if(!contactStateByBucket[bucketKey].armed && !isHardRetrigger && !isSurfaceRehit) {
 		return null
 	}
 
@@ -740,6 +749,7 @@ const reportImpacts = () => {
 				intensity,
 				maxImpulse,
 				maxNormalVelocity,
+				downwardSpeed: Math.max(0, -body0.getLinearVelocity().y()),
 				activeBucketKeys
 			})
 			if(event) {
@@ -758,6 +768,7 @@ const reportImpacts = () => {
 				intensity,
 				maxImpulse,
 				maxNormalVelocity,
+				downwardSpeed: Math.max(0, -body1.getLinearVelocity().y()),
 				activeBucketKeys
 			})
 			if(event) {
