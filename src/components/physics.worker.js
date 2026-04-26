@@ -35,6 +35,8 @@ const defaultOptions = {
 	impactRetriggerDelta: .5,
 	impactNormalVelocityFloor: .42,
 	impactImpulseFloor: .55,
+	impactReleaseThreshold: .1,
+	impactReleaseNormalVelocityFloor: .18,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -42,7 +44,7 @@ let config = {...defaultOptions}
 
 let emptyVector
 let diceBufferView
-let contactStateByPair = {}
+let contactStateByBucket = {}
 
 self.onmessage = (e) => {
   switch (e.data.action) {
@@ -512,7 +514,7 @@ const clearDice = () => {
 		diceBufferView.fill(0)
 	}
 	stopLoop = true
-	contactStateByPair = {}
+	contactStateByBucket = {}
 	// clear all bodies
 	bodies.forEach(body => physicsWorld.removeRigidBody(body))
 	sleepingBodies.forEach(body => physicsWorld.removeRigidBody(body))
@@ -549,12 +551,128 @@ const getImpactKind = (body0Id, body1Id) => {
 	return 'unknown'
 }
 
-const getImpactPairKey = (body0Id, body1Id) => [body0Id, body1Id].sort().join(':')
+const negateVector = (vector) => ({
+	x: -vector.x,
+	y: -vector.y,
+	z: -vector.z
+})
+
+const toLocalVector = (rigidBody, worldVector) => {
+	const rotation = rigidBody.getWorldTransform().getRotation()
+	const x = rotation.x()
+	const y = rotation.y()
+	const z = rotation.z()
+	const w = rotation.w()
+
+	const ix = w * worldVector.x + y * worldVector.z - z * worldVector.y
+	const iy = w * worldVector.y + z * worldVector.x - x * worldVector.z
+	const iz = w * worldVector.z + x * worldVector.y - y * worldVector.x
+	const iw = x * worldVector.x + y * worldVector.y + z * worldVector.z
+
+	return {
+		x: ix * w + iw * x - iy * z + iz * y,
+		y: iy * w + iw * y - iz * x + ix * z,
+		z: iz * w + iw * z - ix * y + iy * x
+	}
+}
+
+const getAxisSign = (axis, value) => `${axis}${value >= 0 ? '+' : '-'}`
+
+const getBucketFromLocalNormal = (localNormal) => {
+	const components = [
+		{ axis: 'x', value: localNormal.x, abs: Math.abs(localNormal.x) },
+		{ axis: 'y', value: localNormal.y, abs: Math.abs(localNormal.y) },
+		{ axis: 'z', value: localNormal.z, abs: Math.abs(localNormal.z) }
+	].sort((left, right) => right.abs - left.abs)
+
+	const [first, second, third] = components
+	if(first.abs > .84 && second.abs < .42) {
+		return `face:${getAxisSign(first.axis, first.value)}`
+	}
+
+	if(third.abs < .32) {
+		const edgeAxes = [getAxisSign(first.axis, first.value), getAxisSign(second.axis, second.value)].sort()
+		return `edge:${edgeAxes.join(':')}`
+	}
+
+	const cornerAxes = [
+		getAxisSign(first.axis, first.value),
+		getAxisSign(second.axis, second.value),
+		getAxisSign(third.axis, third.value)
+	].sort()
+	return `corner:${cornerAxes.join(':')}`
+}
+
+const getContactBucketKey = (rigidBody, bodyId, kind, worldNormal) => {
+	const localNormal = toLocalVector(rigidBody, worldNormal)
+	return `${bodyId}:${kind}:${getBucketFromLocalNormal(localNormal)}`
+}
+
+const evaluateImpactCandidate = ({
+	now,
+	rigidBody,
+	bodyId,
+	kind,
+	worldNormal,
+	intensity,
+	maxImpulse,
+	maxNormalVelocity,
+	activeBucketKeys
+}) => {
+	const bucketKey = getContactBucketKey(rigidBody, bodyId, kind, worldNormal)
+	activeBucketKeys.add(bucketKey)
+
+	const previous = contactStateByBucket[bucketKey]
+	const releaseSatisfied = !previous
+		|| previous.armed
+		|| now - previous.lastSeenAt > config.impactReleaseMs
+		|| intensity <= config.impactReleaseThreshold
+		|| maxNormalVelocity <= config.impactReleaseNormalVelocityFloor
+	const isHardRetrigger = previous
+		&& !releaseSatisfied
+		&& intensity >= previous.peakIntensity + config.impactRetriggerDelta
+		&& now - previous.lastImpactAt > config.impactCooldown
+	const hasEnoughImpact = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= config.impactImpulseFloor
+
+	contactStateByBucket[bucketKey] = {
+		lastSeenAt: now,
+		lastImpactAt: previous?.lastImpactAt || 0,
+		peakIntensity: releaseSatisfied ? intensity : Math.max(previous?.peakIntensity || 0, intensity),
+		armed: releaseSatisfied
+	}
+
+	if(intensity < config.impactThreshold || !hasEnoughImpact) {
+		if(intensity <= config.impactReleaseThreshold || maxNormalVelocity <= config.impactReleaseNormalVelocityFloor) {
+			contactStateByBucket[bucketKey].armed = true
+			contactStateByBucket[bucketKey].peakIntensity = intensity
+		}
+		return null
+	}
+
+	if(!contactStateByBucket[bucketKey].armed && !isHardRetrigger) {
+		return null
+	}
+
+	contactStateByBucket[bucketKey].armed = false
+	contactStateByBucket[bucketKey].lastImpactAt = now
+	contactStateByBucket[bucketKey].peakIntensity = intensity
+
+	return {
+		action: "collision",
+		body0Id: bodyId,
+		body1Id: bucketKey,
+		kind,
+		intensity,
+		impulse: maxImpulse,
+		velocity: maxNormalVelocity,
+		at: now
+	}
+}
 
 const reportImpacts = () => {
 	const now = Date.now()
 	const numManifolds = physicsWorld.getDispatcher().getNumManifolds()
-	const activePairKeys = new Set()
+	const activeBucketKeys = new Set()
 
 	for (let i = 0; i < numManifolds; i++) {
 		const contactManifold = physicsWorld.getDispatcher().getManifoldByIndexInternal(i)
@@ -570,6 +688,7 @@ const reportImpacts = () => {
 		let maxImpulse = 0
 		let maxNormalVelocity = 0
 		let hasContact = false
+		let representativeNormal = null
 		const numContacts = contactManifold.getNumContacts()
 
 		for (let j = 0; j < numContacts; j++) {
@@ -583,6 +702,13 @@ const reportImpacts = () => {
 			maxImpulse = Math.max(maxImpulse, Math.abs(contactPoint.getAppliedImpulse()))
 
 			const normal = contactPoint.get_m_normalWorldOnB()
+			if(!representativeNormal) {
+				representativeNormal = {
+					x: normal.x(),
+					y: normal.y(),
+					z: normal.z()
+				}
+			}
 			const velocity0 = body0.getLinearVelocity()
 			const velocity1 = body1.getLinearVelocity()
 			const relativeX = velocity0.x() - velocity1.x()
@@ -600,48 +726,50 @@ const reportImpacts = () => {
 			continue
 		}
 
-		const pairKey = getImpactPairKey(body0Id, body1Id)
-		activePairKeys.add(pairKey)
-
 		const intensity = Math.min(1, Math.max(maxImpulse / 3.5, maxNormalVelocity / 8.5))
-		const previousContact = contactStateByPair[pairKey]
-		const isNewContact = !previousContact || now - previousContact.lastSeenAt > config.impactReleaseMs
-		const isHardNewHit = previousContact
-			&& intensity >= previousContact.peakIntensity + config.impactRetriggerDelta
-			&& now - previousContact.lastImpactAt > config.impactCooldown
-		const hasEnoughNormalHit = maxNormalVelocity >= config.impactNormalVelocityFloor || maxImpulse >= config.impactImpulseFloor
+		const kind = getImpactKind(body0Id, body1Id)
+		const worldNormal = representativeNormal
 
-		contactStateByPair[pairKey] = {
-			lastSeenAt: now,
-			lastImpactAt: previousContact?.lastImpactAt || 0,
-			peakIntensity: isNewContact ? intensity : Math.max(previousContact?.peakIntensity || 0, intensity)
+		if(isActiveDieBody(body0Id)) {
+			const event = evaluateImpactCandidate({
+				now,
+				rigidBody: body0,
+				bodyId: body0Id,
+				kind,
+				worldNormal: negateVector(worldNormal),
+				intensity,
+				maxImpulse,
+				maxNormalVelocity,
+				activeBucketKeys
+			})
+			if(event) {
+				event.body1Id = body1Id
+				self.postMessage(event)
+			}
 		}
 
-		if(
-			intensity < config.impactThreshold
-			|| !hasEnoughNormalHit
-			|| (!isNewContact && !isHardNewHit)
-		) {
-			continue
+		if(isActiveDieBody(body1Id)) {
+			const event = evaluateImpactCandidate({
+				now,
+				rigidBody: body1,
+				bodyId: body1Id,
+				kind,
+				worldNormal,
+				intensity,
+				maxImpulse,
+				maxNormalVelocity,
+				activeBucketKeys
+			})
+			if(event) {
+				event.body1Id = body0Id
+				self.postMessage(event)
+			}
 		}
-
-		contactStateByPair[pairKey].lastImpactAt = now
-
-		self.postMessage({
-			action: "collision",
-			body0Id,
-			body1Id,
-			kind: getImpactKind(body0Id, body1Id),
-			intensity,
-			impulse: maxImpulse,
-			velocity: maxNormalVelocity,
-			at: now
-		})
 	}
 
-	Object.entries(contactStateByPair).forEach(([pairKey, contact]) => {
-		if(!activePairKeys.has(pairKey) && now - contact.lastSeenAt > config.impactReleaseMs) {
-			delete contactStateByPair[pairKey]
+	Object.entries(contactStateByBucket).forEach(([bucketKey, contact]) => {
+		if(!activeBucketKeys.has(bucketKey) && now - contact.lastSeenAt > config.impactReleaseMs) {
+			delete contactStateByBucket[bucketKey]
 		}
 	})
 }
