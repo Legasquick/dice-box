@@ -40,6 +40,8 @@ const defaultOptions = {
 	impactSurfaceThreshold: .16,
 	impactSurfaceRetriggerVelocityFloor: .32,
 	impactSurfaceRetriggerCooldown: 80,
+	impactRecoveryRatio: .45,
+	impactVelocityRecoveryRatio: .55,
 	// TODO: toss: "center", "edge", "allEdges"
 }
 
@@ -627,8 +629,19 @@ const evaluateImpactCandidate = ({
 	activeBucketKeys.add(bucketKey)
 
 	const previous = contactStateByBucket[bucketKey]
+	const recoveredIntensityThreshold = previous
+		? Math.max(config.impactReleaseThreshold, previous.peakIntensity * config.impactRecoveryRatio)
+		: config.impactReleaseThreshold
+	const recoveredVelocityThreshold = previous
+		? Math.max(config.impactReleaseNormalVelocityFloor, previous.peakNormalVelocity * config.impactVelocityRecoveryRatio)
+		: config.impactReleaseNormalVelocityFloor
+	const rearmedFromRecovery = !!previous
+		&& !previous.armed
+		&& now - previous.lastImpactAt > config.impactCooldown
+		&& (intensity <= recoveredIntensityThreshold || maxNormalVelocity <= recoveredVelocityThreshold)
 	const releaseSatisfied = !previous
 		|| previous.armed
+		|| rearmedFromRecovery
 		|| now - previous.lastSeenAt > config.impactReleaseMs
 		|| intensity <= config.impactReleaseThreshold
 		|| maxNormalVelocity <= config.impactReleaseNormalVelocityFloor
@@ -647,6 +660,7 @@ const evaluateImpactCandidate = ({
 		lastSeenAt: now,
 		lastImpactAt: previous?.lastImpactAt || 0,
 		peakIntensity: releaseSatisfied ? intensity : Math.max(previous?.peakIntensity || 0, intensity),
+		peakNormalVelocity: releaseSatisfied ? maxNormalVelocity : Math.max(previous?.peakNormalVelocity || 0, maxNormalVelocity),
 		armed: releaseSatisfied
 	}
 
